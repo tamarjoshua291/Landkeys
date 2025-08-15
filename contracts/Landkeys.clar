@@ -16,11 +16,19 @@
 (define-constant err-invalid-valuation (err u111))
 (define-constant err-appraisal-too-recent (err u112))
 (define-constant err-insufficient-stake (err u113))
+(define-constant err-subdivision-not-found (err u114))
+(define-constant err-subdivision-already-approved (err u115))
+(define-constant err-invalid-subdivision-area (err u116))
+(define-constant err-subdivision-pending (err u117))
+(define-constant err-too-many-subdivisions (err u118))
+(define-constant err-minimum-parcel-size (err u119))
 
 (define-data-var last-token-id uint u0)
 (define-data-var contract-uri (optional (string-utf8 256)) none)
 (define-data-var minimum-appraiser-stake uint u1000000)
 (define-data-var appraisal-cooldown-period uint u144)
+(define-data-var subdivision-counter uint u0)
+(define-data-var minimum-parcel-size uint u100)
 
 (define-map land-registry
   uint
@@ -158,6 +166,61 @@
     resolution-status: (string-ascii 20),
     arbitrator: (optional principal),
     final-ruling: (optional uint)
+  }
+)
+
+;; Subdivision management maps
+(define-map subdivision-proposals
+  uint
+  {
+    parent-token-id: uint,
+    proposer: principal,
+    total-parcels: uint,
+    parcel-areas: (list 10 uint),
+    parcel-descriptions: (list 10 (string-utf8 256)),
+    subdivision-purpose: (string-utf8 256),
+    proposed-at: uint,
+    status: (string-ascii 20),
+    approval-date: (optional uint),
+    approved-by: (optional principal)
+  }
+)
+
+(define-map land-subdivisions
+  uint
+  {
+    parent-token-id: uint,
+    child-token-ids: (list 10 uint),
+    subdivision-date: uint,
+    original-area: uint,
+    remaining-area: uint,
+    subdivision-type: (string-ascii 30),
+    legal-description: (string-utf8 512),
+    surveyor: (optional principal),
+    subdivision-fees: uint
+  }
+)
+
+(define-map parcel-relationships
+  uint
+  {
+    parent-token-id: (optional uint),
+    child-token-ids: (list 10 uint),
+    subdivision-level: uint,
+    original-root-id: uint,
+    relationship-type: (string-ascii 20)
+  }
+)
+
+(define-map subdivision-requirements
+  (string-ascii 30)
+  {
+    minimum-area: uint,
+    maximum-parcels: uint,
+    approval-required: bool,
+    fees-required: uint,
+    documentation-needed: (list 5 (string-ascii 50)),
+    restrictions: (string-utf8 256)
   }
 )
 
@@ -570,6 +633,232 @@
   (+ current sum-so-far)
 )
 
+;; Subdivision Management Functions
+(define-public (propose-land-subdivision (parent-token-id uint) (parcel-areas (list 10 uint)) (parcel-descriptions (list 10 (string-utf8 256))) (subdivision-purpose (string-utf8 256)) (subdivision-type (string-ascii 30)))
+  (let
+    (
+      (proposal-id (+ (var-get subdivision-counter) u1))
+      (token-owner (unwrap! (nft-get-owner? landkey parent-token-id) err-token-not-found))
+      (land-info (unwrap! (map-get? land-registry parent-token-id) err-token-not-found))
+      (total-proposed-area (fold calculate-total-area parcel-areas u0))
+      (original-area (get size-sqm land-info))
+      (min-size (var-get minimum-parcel-size))
+      (requirements (map-get? subdivision-requirements subdivision-type))
+    )
+    ;; Validate ownership and basic requirements
+    (asserts! (is-eq tx-sender token-owner) err-not-token-owner)
+    (asserts! (<= total-proposed-area original-area) err-invalid-subdivision-area)
+    (asserts! (<= (len parcel-areas) u10) err-too-many-subdivisions)
+    (asserts! (check-minimum-parcel-sizes parcel-areas min-size) err-minimum-parcel-size)
+    
+    ;; Check subdivision type requirements if they exist
+    (match requirements
+      reqs (begin
+        (asserts! (>= original-area (get minimum-area reqs)) err-invalid-subdivision-area)
+        (asserts! (<= (len parcel-areas) (get maximum-parcels reqs)) err-too-many-subdivisions)
+      )
+      true
+    )
+    
+    ;; Create subdivision proposal
+    (map-set subdivision-proposals proposal-id {
+      parent-token-id: parent-token-id,
+      proposer: tx-sender,
+      total-parcels: (len parcel-areas),
+      parcel-areas: parcel-areas,
+      parcel-descriptions: parcel-descriptions,
+      subdivision-purpose: subdivision-purpose,
+      proposed-at: stacks-block-height,
+      status: "pending",
+      approval-date: none,
+      approved-by: none
+    })
+    
+    (var-set subdivision-counter proposal-id)
+    (ok proposal-id)
+  )
+)
+
+(define-public (approve-subdivision-proposal (proposal-id uint))
+  (let
+    (
+      (proposal (unwrap! (map-get? subdivision-proposals proposal-id) err-subdivision-not-found))
+      (subdivision-type (get status proposal))
+    )
+    ;; Only contract owner can approve subdivisions
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-eq subdivision-type "pending") err-subdivision-already-approved)
+    
+    ;; Update proposal status
+    (map-set subdivision-proposals proposal-id
+      (merge proposal {
+        status: "approved",
+        approval-date: (some stacks-block-height),
+        approved-by: (some tx-sender)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (execute-land-subdivision (proposal-id uint) (legal-description (string-utf8 512)) (surveyor (optional principal)))
+  (let
+    (
+      (proposal (unwrap! (map-get? subdivision-proposals proposal-id) err-subdivision-not-found))
+      (parent-token-id (get parent-token-id proposal))
+      (token-owner (unwrap! (nft-get-owner? landkey parent-token-id) err-token-not-found))
+      (land-info (unwrap! (map-get? land-registry parent-token-id) err-token-not-found))
+      (parcel-areas (get parcel-areas proposal))
+      (parcel-descriptions (get parcel-descriptions proposal))
+      (current-block stacks-block-height)
+    )
+    ;; Validate permissions and status
+    (asserts! (is-eq tx-sender (get proposer proposal)) err-not-token-owner)
+    (asserts! (is-eq (get status proposal) "approved") err-subdivision-pending)
+    
+    ;; Execute the subdivision
+    (let
+      (
+        (new-token-ids (create-subdivision-parcels parent-token-id parcel-areas parcel-descriptions (get latitude land-info) (get longitude land-info)))
+        (total-subdivided-area (fold calculate-total-area parcel-areas u0))
+        (remaining-area (- (get size-sqm land-info) total-subdivided-area))
+      )
+      ;; Record subdivision details
+      (map-set land-subdivisions proposal-id {
+        parent-token-id: parent-token-id,
+        child-token-ids: new-token-ids,
+        subdivision-date: current-block,
+        original-area: (get size-sqm land-info),
+        remaining-area: remaining-area,
+        subdivision-type: "residential",
+        legal-description: legal-description,
+        surveyor: surveyor,
+        subdivision-fees: u0
+      })
+      
+      ;; Update parent land area
+      (map-set land-registry parent-token-id
+        (merge land-info {
+          size-sqm: remaining-area,
+          last-updated: current-block
+        })
+      )
+      
+      ;; Update parcel relationships
+      (update-parcel-relationships parent-token-id new-token-ids)
+      
+      ;; Mark proposal as executed
+      (map-set subdivision-proposals proposal-id
+        (merge proposal { status: "executed" })
+      )
+      
+      (ok new-token-ids)
+    )
+  )
+)
+
+(define-public (set-subdivision-requirements (subdivision-type (string-ascii 30)) (min-area uint) (max-parcels uint) (approval-required bool) (fees uint) (docs (list 5 (string-ascii 50))) (restrictions (string-utf8 256)))
+  (begin
+    ;; Only contract owner can set requirements
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    
+    (map-set subdivision-requirements subdivision-type {
+      minimum-area: min-area,
+      maximum-parcels: max-parcels,
+      approval-required: approval-required,
+      fees-required: fees,
+      documentation-needed: docs,
+      restrictions: restrictions
+    })
+    (ok true)
+  )
+)
+
+;; Helper functions for subdivision management
+(define-private (create-subdivision-parcels (parent-id uint) (areas (list 10 uint)) (descriptions (list 10 (string-utf8 256))) (base-lat int) (base-lng int))
+  (let
+    (
+      (new-ids (map create-single-parcel (zip areas descriptions)))
+    )
+    new-ids
+  )
+)
+
+(define-private (create-single-parcel (area-desc {area: uint, description: (string-utf8 256)}))
+  (let
+    (
+      (new-token-id (+ (var-get last-token-id) u1))
+      (area (get area area-desc))
+      (description (get description area-desc))
+    )
+    ;; Create new NFT for subdivided parcel
+    (unwrap-panic (nft-mint? landkey new-token-id tx-sender))
+    
+    ;; Register new land parcel
+    (map-set land-registry new-token-id {
+      latitude: 0, ;; Would be calculated based on subdivision layout
+      longitude: 0,
+      size-sqm: area,
+      access-type: "private",
+      description: description,
+      created-at: stacks-block-height,
+      last-updated: stacks-block-height
+    })
+    
+    (var-set last-token-id new-token-id)
+    new-token-id
+  )
+)
+
+(define-private (update-parcel-relationships (parent-id uint) (child-ids (list 10 uint)))
+  (begin
+    ;; Update parent relationship
+    (map-set parcel-relationships parent-id {
+      parent-token-id: none,
+      child-token-ids: child-ids,
+      subdivision-level: u1,
+      original-root-id: parent-id,
+      relationship-type: "parent"
+    })
+    
+    ;; Set relationships for each child
+    (map set-child-relationship child-ids)
+    true
+  )
+)
+
+(define-private (set-child-relationship (child-id uint))
+  (map-set parcel-relationships child-id {
+    parent-token-id: none,
+    child-token-ids: (list),
+    subdivision-level: u1,
+    original-root-id: child-id,
+    relationship-type: "child"
+  })
+)
+
+
+
+(define-private (calculate-total-area (area uint) (total uint))
+  (+ area total)
+)
+
+(define-private (check-minimum-parcel-sizes (areas (list 10 uint)) (min-size uint))
+  (fold check-single-area areas true)
+)
+
+(define-private (check-single-area (area uint) (valid bool))
+  (and valid (>= area (var-get minimum-parcel-size)))
+)
+
+(define-private (zip (areas (list 10 uint)) (descriptions (list 10 (string-utf8 256))))
+  (map create-area-desc-pair areas)
+)
+
+(define-private (create-area-desc-pair (area uint))
+  { area: area, description: u"Subdivided parcel" }
+)
+
 (define-read-only (get-last-token-id)
   (ok (var-get last-token-id))
 )
@@ -725,3 +1014,88 @@
 (define-read-only (get-appraisal-cooldown-period)
   (var-get appraisal-cooldown-period)
 )
+
+;; Subdivision read-only functions
+(define-read-only (get-subdivision-proposal (proposal-id uint))
+  (map-get? subdivision-proposals proposal-id)
+)
+
+(define-read-only (get-land-subdivision (subdivision-id uint))
+  (map-get? land-subdivisions subdivision-id)
+)
+
+(define-read-only (get-parcel-relationships (token-id uint))
+  (map-get? parcel-relationships token-id)
+)
+
+(define-read-only (get-subdivision-requirements (subdivision-type (string-ascii 30)))
+  (map-get? subdivision-requirements subdivision-type)
+)
+
+(define-read-only (get-subdivision-counter)
+  (var-get subdivision-counter)
+)
+
+(define-read-only (get-minimum-parcel-size)
+  (var-get minimum-parcel-size)
+)
+
+(define-read-only (is-subdivided-land (token-id uint))
+  (let
+    (
+      (relationships (map-get? parcel-relationships token-id))
+    )
+    (match relationships
+      rel (> (len (get child-token-ids rel)) u0)
+      false
+    )
+  )
+)
+
+(define-read-only (get-parent-land (token-id uint))
+  (let
+    (
+      (relationships (map-get? parcel-relationships token-id))
+    )
+    (match relationships
+      rel (get parent-token-id rel)
+      none
+    )
+  )
+)
+
+(define-read-only (get-child-parcels (token-id uint))
+  (let
+    (
+      (relationships (map-get? parcel-relationships token-id))
+    )
+    (match relationships
+      rel (some (get child-token-ids rel))
+      none
+    )
+  )
+)
+
+(define-read-only (calculate-subdivision-fees (token-id uint) (num-parcels uint))
+  (let
+    (
+      (land-info (map-get? land-registry token-id))
+      (base-fee u50000)
+      (per-parcel-fee u10000)
+    )
+    (match land-info
+      info (let
+        (
+          (area-fee (/ (get size-sqm info) u100))
+          (total-fee (+ base-fee (* per-parcel-fee num-parcels) area-fee))
+        )
+        (some total-fee)
+      )
+      none
+    )
+  )
+)
+
+
+
+
