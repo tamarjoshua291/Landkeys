@@ -22,6 +22,15 @@
 (define-constant err-subdivision-pending (err u117))
 (define-constant err-too-many-subdivisions (err u118))
 (define-constant err-minimum-parcel-size (err u119))
+(define-constant err-not-land-owner (err u120))
+(define-constant err-rental-offer-not-found (err u121))
+(define-constant err-rental-offer-active (err u122))
+(define-constant err-rental-not-found (err u123))
+(define-constant err-not-authorized (err u124))
+(define-constant err-invalid-rental-period (err u125))
+(define-constant err-rental-already-taken (err u126))
+(define-constant err-rental-not-started (err u128))
+(define-constant err-rental-ended (err u129))
 
 (define-data-var last-token-id uint u0)
 (define-data-var contract-uri (optional (string-utf8 256)) none)
@@ -221,6 +230,26 @@
     fees-required: uint,
     documentation-needed: (list 5 (string-ascii 50)),
     restrictions: (string-utf8 256)
+  }
+)
+
+;; Land Rental System Maps
+(define-map rental-offers
+  uint  ;; token-id
+  {
+    owner: principal,
+    price-per-block: uint,
+    start-block: uint,
+    end-block: uint,
+    renter: (optional principal)
+  }
+)
+
+(define-map active-rentals
+  uint  ;; token-id
+  {
+    renter: principal,
+    rental-end-block: uint
   }
 )
 
@@ -859,6 +888,92 @@
   { area: area, description: u"Subdivided parcel" }
 )
 
+;; Land Rental System Functions
+
+;; Create a rental offer for a land NFT
+(define-public (create-rental-offer (token-id uint) (price-per-block uint) (start-block uint) (end-block uint))
+  (let (
+        (owner (unwrap! (nft-get-owner? landkey token-id) err-not-land-owner)))
+    (begin
+      (asserts! (is-eq tx-sender owner) err-not-land-owner)
+      (asserts! (> end-block start-block) err-invalid-rental-period)
+      (asserts! (is-none (map-get? rental-offers token-id)) err-rental-offer-active)
+      (map-set rental-offers token-id {
+        owner: owner,
+        price-per-block: price-per-block,
+        start-block: start-block,
+        end-block: end-block,
+        renter: none
+      })
+      (ok true)
+    )))
+
+;; Cancel an existing rental offer (only if not rented)
+(define-public (cancel-rental-offer (token-id uint))
+  (let (
+        (offer (unwrap! (map-get? rental-offers token-id) err-rental-offer-not-found)))
+    (begin
+      (asserts! (is-eq tx-sender (get owner offer)) err-not-land-owner)
+      (asserts! (is-none (get renter offer)) err-rental-offer-active)
+      (map-delete rental-offers token-id)
+      (ok true)
+    )))
+
+;; Accept rental offer and pay rent upfront
+(define-public (accept-rental (token-id uint))
+  (let (
+        (offer (unwrap! (map-get? rental-offers token-id) err-rental-offer-not-found))
+        (owner (get owner offer))
+        (price-per-block (get price-per-block offer))
+        (start-block (get start-block offer))
+        (end-block (get end-block offer))
+        (current-block stacks-block-height)
+        (renter tx-sender)
+        (rental-duration (- end-block start-block))
+        (total-rent (* price-per-block rental-duration))
+       )
+    (begin
+      (asserts! (is-none (get renter offer)) err-rental-already-taken)
+      (asserts! (>= current-block start-block) err-rental-not-started)
+      (asserts! (<= current-block end-block) err-rental-ended)
+      (try! (stx-transfer? total-rent renter owner))
+      ;; Update rental offer with renter info
+      (map-set rental-offers token-id (merge offer { renter: (some renter) }))
+      ;; Grant access permission to renter for rental duration
+      (map-set access-permissions { token-id: token-id, user: renter } {
+        permission-type: "rental",
+        granted-at: current-block,
+        expires-at: (some end-block),
+        granted-by: owner
+      })
+      ;; Record active rental
+      (map-set active-rentals token-id {
+        renter: renter,
+        rental-end-block: end-block
+      })
+      (ok true)
+    )))
+
+;; Terminate rental before expiry (by owner or renter)
+(define-public (terminate-rental (token-id uint))
+  (let (
+        (rental (unwrap! (map-get? active-rentals token-id) err-rental-not-found))
+        (offer (unwrap! (map-get? rental-offers token-id) err-rental-offer-not-found))
+        (owner (get owner offer))
+        (renter (get renter rental))
+        (caller tx-sender)
+       )
+    (begin
+      (asserts! (or (is-eq caller owner) (is-eq caller renter)) err-not-authorized)
+      ;; Remove renter from offer
+      (map-set rental-offers token-id (merge offer { renter: none }))
+      ;; Delete active rental record
+      (map-delete active-rentals token-id)
+      ;; Revoke rental permission
+      (map-delete access-permissions { token-id: token-id, user: renter })
+      (ok true)
+    )))
+
 (define-read-only (get-last-token-id)
   (ok (var-get last-token-id))
 )
@@ -901,17 +1016,26 @@
       (token-owner (nft-get-owner? landkey token-id))
       (permission (map-get? access-permissions { token-id: token-id, user: user }))
       (current-block stacks-block-height)
+      (rental (map-get? active-rentals token-id))
     )
     (if (is-eq (some user) token-owner)
       true
-      (match permission
-        perm (match (get expires-at perm)
-          expiry (< current-block expiry)
-          true
-        )
-        false
-      )
-    )
+      (match rental
+        rented (if (and (is-eq (get renter rented) user)
+                        (<= current-block (get rental-end-block rented)))
+                   true
+                   (match permission
+                     perm (match (get expires-at perm)
+                            expiry (< current-block expiry)
+                            true
+                           )
+                     false))
+        (match permission
+               perm (match (get expires-at perm)
+                      expiry (< current-block expiry)
+                      true
+                     )
+               false)))
   )
 )
 
@@ -1095,6 +1219,61 @@
     )
   )
 )
+
+;; Rental System Read-only Functions
+
+;; Read-only function to get rental offer
+(define-read-only (get-rental-offer (token-id uint))
+  (map-get? rental-offers token-id))
+
+;; Read-only function to get active rental
+(define-read-only (get-active-rental (token-id uint))
+  (map-get? active-rentals token-id))
+
+;; Check if a land is currently rented
+(define-read-only (is-land-rented (token-id uint))
+  (let (
+        (rental (map-get? active-rentals token-id))
+        (current-block stacks-block-height)
+       )
+    (match rental
+      active-rental (< current-block (get rental-end-block active-rental))
+      false)))
+
+;; Check if a rental has expired
+(define-read-only (is-rental-expired (token-id uint))
+  (let (
+        (rental (map-get? active-rentals token-id))
+        (current-block stacks-block-height)
+       )
+    (match rental
+      active-rental (>= current-block (get rental-end-block active-rental))
+      true)))
+
+;; Get current renter for a land
+(define-read-only (get-current-renter (token-id uint))
+  (let (
+        (rental (map-get? active-rentals token-id))
+        (current-block stacks-block-height)
+       )
+    (match rental
+      active-rental (if (< current-block (get rental-end-block active-rental))
+                       (some (get renter active-rental))
+                       none)
+      none)))
+
+;; Calculate total rent for a rental offer
+(define-read-only (calculate-rental-cost (token-id uint))
+  (let (
+        (offer (map-get? rental-offers token-id))
+       )
+    (match offer
+      rental-offer (let (
+                     (duration (- (get end-block rental-offer) (get start-block rental-offer)))
+                     (price-per-block (get price-per-block rental-offer))
+                    )
+                    (some (* duration price-per-block)))
+      none)))
 
 
 
